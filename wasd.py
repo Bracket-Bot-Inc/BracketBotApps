@@ -10,8 +10,8 @@ import numpy as np
 import sys, select, termios, tty
 
 # Configuration
-TURN_SPEED = 0.5
-SPEED = 0.1
+TURN_SPEED = 0.6
+SPEED = 0.15
 # Global variables
 writer = None
 
@@ -55,9 +55,9 @@ def main():
                 elif c.lower() == 's':
                     twist = [-SPEED, 0.0]
                 elif c.lower() == 'a':
-                    twist = [0.0, -TURN_SPEED]
-                elif c.lower() == 'd':
                     twist = [0.0, TURN_SPEED]
+                elif c.lower() == 'd':
+                    twist = [0.0, -TURN_SPEED]
                 elif c.lower() == 'q':
                     break
             else:
