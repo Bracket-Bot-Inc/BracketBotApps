@@ -4,6 +4,7 @@
 #   "fastapi",
 #   "uvicorn",
 #   "wsproto",
+#   "httpx",
 # ]
 # [tool.uv.sources]
 # bbos = { path = "/home/bracketbot/BracketBotOS", editable = true }
@@ -11,14 +12,18 @@
 import asyncio
 import json
 import signal
+import socket
+import re
 from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import uvicorn
+import httpx
 
 from bbos.app_manager import get_status, start_app, stop_app
 
 REFRESH_TIME: float = 2.0  # seconds
+PORT_SCAN_RANGE = range(8000, 8010)  # Scan ports 8000-8009
 
 _stop = False
 
@@ -27,6 +32,62 @@ def _sigint(*_):
     _stop = True
 
 signal.signal(signal.SIGINT, _sigint)
+
+async def check_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
+    """Check if a port is open and accepting connections."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=timeout
+        )
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+        return False
+
+async def get_page_title(port: int, timeout: float = 2.0) -> str:
+    """Attempt to get the page title from a service running on the given port."""
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(f"http://localhost:{port}/")
+            if response.status_code == 200:
+                # Try to extract title from HTML
+                content = response.text
+                title_match = re.search(r'<title[^>]*>([^<]+)</title>', content, re.IGNORECASE)
+                if title_match:
+                    return title_match.group(1).strip()
+                # If no title, return a generic name
+                return f"Service on port {port}"
+    except Exception:
+        pass
+    return f"Port {port}"
+
+async def scan_ports() -> dict:
+    """Scan for active services in the port range."""
+    active_services = {}
+    
+    # Check each port in parallel
+    tasks = []
+    for port in PORT_SCAN_RANGE:
+        tasks.append(check_port_open('localhost', port))
+    
+    results = await asyncio.gather(*tasks)
+    
+    # For open ports, get their titles
+    title_tasks = []
+    open_ports = []
+    for port, is_open in zip(PORT_SCAN_RANGE, results):
+        if is_open:
+            open_ports.append(port)
+            title_tasks.append(get_page_title(port))
+    
+    if title_tasks:
+        titles = await asyncio.gather(*title_tasks)
+        for port, title in zip(open_ports, titles):
+            active_services[port] = title
+    
+    return active_services
 
 def main():
     app = FastAPI()
@@ -132,10 +193,49 @@ h1, h2 {
   color: #888;
   font-style: italic;
 }
+
+.services-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 15px;
+  margin-top: 15px;
+}
+
+.service-btn {
+  background: #2196F3;
+  color: white;
+  border: none;
+  padding: 20px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 16px;
+  text-align: center;
+  text-decoration: none;
+  display: block;
+  transition: all 0.3s ease;
+  box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+}
+
+.service-btn:hover {
+  background: #1976D2;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 10px rgba(0,0,0,0.4);
+}
+
+.service-port {
+  font-size: 12px;
+  color: #BBB;
+  margin-top: 5px;
+}
 </style>
 
 <div class="container">
   <h1>🤖 BracketBot Dashboard</h1>
+  
+  <div class="section">
+    <h2>Active Services</h2>
+    <div id="services-container" class="loading">Scanning for services...</div>
+  </div>
   
   <div class="section">
     <h2>Applications</h2>
@@ -157,7 +257,12 @@ function connectWebSocket() {
   
   ws.onmessage = function(event) {
     const data = JSON.parse(event.data);
-    updateApps(data);
+    if (data.apps) {
+      updateApps(data.apps);
+    }
+    if (data.services) {
+      updateServices(data.services);
+    }
   };
   
   ws.onclose = function() {
@@ -180,6 +285,31 @@ function toggleApp(appName, isRunning) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     const action = isRunning ? "stop_app" : "start_app";
     ws.send(JSON.stringify({ action: action, app_name: appName }));
+  }
+}
+
+function updateServices(services) {
+  const container = document.getElementById("services-container");
+  container.innerHTML = "";
+  container.className = "services-grid";
+  
+  if (Object.keys(services).length === 0) {
+    container.innerHTML = "<div class='loading'>No active services found</div>";
+    return;
+  }
+  
+  for (const [port, title] of Object.entries(services)) {
+    const link = document.createElement("a");
+    link.href = `http://${window.location.hostname}:${port}/`;
+    link.target = "_blank";
+    link.className = "service-btn";
+    
+    link.innerHTML = `
+      <div>${title}</div>
+      <div class="service-port">Port ${port}</div>
+    `;
+    
+    container.appendChild(link);
   }
 }
 
@@ -222,6 +352,15 @@ setInterval(requestStatus, """ + str(int(REFRESH_TIME * 1000)) + """);
         await websocket.accept()
         print("[dashboard] WebSocket client connected")
         status = lambda: get_status(exclude=['dashboard'])
+        
+        async def send_full_status():
+            apps = status()
+            services = await scan_ports()
+            await websocket.send_text(json.dumps({
+                "apps": apps,
+                "services": services
+            }))
+        
         try:
             while not _stop:
                 try:
@@ -230,14 +369,14 @@ setInterval(requestStatus, """ + str(int(REFRESH_TIME * 1000)) + """);
                     data = json.loads(message)
                     
                     if data.get("action") == "get_status":
-                        await websocket.send_text(json.dumps(status()))
+                        await send_full_status()
                     
                     elif data.get("action") == "start_app":
                         app_name = data.get("app_name")
                         if app_name:
                             success = start_app(app_name)
                             if success:
-                                await websocket.send_text(json.dumps(status()))
+                                await send_full_status()
                     
                     elif data.get("action") == "stop_app":
                         app_name = data.get("app_name")
@@ -245,11 +384,11 @@ setInterval(requestStatus, """ + str(int(REFRESH_TIME * 1000)) + """);
                             success = stop_app(app_name)
                             print(f"[dashboard] Stopping app: {app_name} - {success}")
                             if success:
-                                await websocket.send_text(json.dumps(status()))
+                                await send_full_status()
                 
                 except asyncio.TimeoutError:
                     # Send periodic status updates
-                    await websocket.send_text(json.dumps(status()))
+                    await send_full_status()
                     
         except WebSocketDisconnect:
             print("[dashboard] WebSocket client disconnected")
